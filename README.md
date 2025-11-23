@@ -6,6 +6,51 @@
 
 阶段一成功实现了全栈基础设施容器化和核心数据模型设计，为后续的任务调度功能打下了坚实基础。
 
+### Mental Model（心智模型）
+
+以下图表展示了系统从用户请求到数据存储的完整流程：
+
+```
+[用户 (User)]
+     ⬇️  (发送 HTTP 请求)
+
+[FastAPI (你的代码)]
+     ⬇️  (解析 JSON，验证数据)
+
+[SQLModel (ORM)]
+     ⬇️  (转换成 SQL 语句)
+
+[PostgreSQL (数据库)]
+     ⬇️
+
+📦 存储结果:
+
+   User表: {id: "...", username: "test_user_1"}
+
+   Workflow表: {id: "...", status: "PENDING"}
+
+   Job表:
+      - Job A (Tiling)
+      - Job B (Branch 1) -> 依赖 Job A
+      - Job C (Branch 2) -> 依赖 Job A
+```
+
+**流程说明：**
+
+1. **用户层**: 用户通过 HTTP 请求（如 `POST /workflows/`）提交任务工作流
+2. **API 层**: FastAPI 接收请求，使用 Pydantic 验证 JSON 数据格式
+3. **ORM 层**: SQLModel 将 Python 对象转换为 SQL 语句
+4. **数据库层**: PostgreSQL 执行 SQL，持久化存储数据
+
+**数据存储示例：**
+
+- **User 表**: 存储用户基本信息
+- **Workflow 表**: 存储工作流元数据（状态、创建时间等）
+- **Job 表**: 存储具体任务，包括：
+  - 任务类型（如 Tiling、Inference）
+  - 分支标识（Branch 1、Branch 2）
+  - 依赖关系（通过 `parent_ids_json` 存储）
+
 ### 核心成果
 
 #### 1. 全栈基础设施容器化
@@ -180,55 +225,6 @@ curl -X POST "http://127.0.0.1:8000/workflows/" \
 }
 ```
 
-### 方法三：使用 Python 脚本
-
-创建一个测试脚本 `test_api.py`：
-
-```python
-import requests
-import json
-
-BASE_URL = "http://127.0.0.1:8000"
-
-# 1. 创建用户
-user_response = requests.post(
-    f"{BASE_URL}/users/",
-    json={"username": "test_user"}
-)
-user = user_response.json()
-print(f"创建用户: {user}")
-
-# 2. 创建 Workflow
-workflow_data = {
-    "user_id": user["id"],
-    "jobs": [
-        {
-            "name": "Job1: 切片",
-            "job_type": "tiling",
-            "branch_id": "main",
-            "parent_indices": []
-        },
-        {
-            "name": "Job2: 推理",
-            "job_type": "inference",
-            "branch_id": "main",
-            "parent_indices": [0]
-        }
-    ]
-}
-
-workflow_response = requests.post(
-    f"{BASE_URL}/workflows/",
-    json=workflow_data
-)
-workflow = workflow_response.json()
-print(f"创建 Workflow: {workflow}")
-```
-
-运行：
-```bash
-python test_api.py
-```
 
 ---
 
