@@ -4,9 +4,7 @@ A distributed task scheduling system for Whole Slide Image (WSI) cell segmentati
 
 ## Demo
 
-📹 **Demo Video**: [Watch the demo video](https://github.com/YOUR_USERNAME/YOUR_REPO/releases/latest) (available in Releases)
-
-> **Note**: Replace `YOUR_USERNAME` and `YOUR_REPO` with your actual GitHub username and repository name. The demo video is available in the latest release.
+📹 **Demo Video**: [Watch the demo video](https://github.com/Yiling-Ma/Branch-Aware-Multi-Tenant-Workflow-Scheduler/releases/latest) (available in Releases)
 
 ## Quick Start
 
