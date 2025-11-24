@@ -3,31 +3,39 @@ from typing import Optional
 
 
 class Settings(BaseSettings):
-    # PostgreSQL 配置
+    # PostgreSQL configuration
     POSTGRES_USER: str = "user"
     POSTGRES_PASSWORD: str = "password"
     POSTGRES_DB: str = "scheduler_db"
     POSTGRES_HOST: str = "localhost"
     POSTGRES_PORT: int = 5432
     
-    # Redis 配置
+    # Redis configuration
     REDIS_HOST: str = "localhost"
     REDIS_PORT: int = 6379
     REDIS_DB: int = 0
     
+    # Scheduler configuration
+    MAX_WORKERS: int = 4  # Global maximum concurrent worker count
+    
+    # Worker configuration
+    INSTANSEG_MODEL_TYPE: str = "brightfield_nuclei"  # Optional: "brightfield_nuclei", "fluorescence_nuclei", "fluorescence_cells"
+    INSTANSEG_IMAGE_READER: str = "openslide"  # for reading files: "openslide" or "tiffslide"
+    INSTANSEG_PIXEL_SIZE: float = 0.5  # Pixel size(micrometers per pixel),has great impact on detection results,needs to be adjusted based on actual images
+    
     @property
     def database_url(self) -> str:
-        """构建 PostgreSQL 数据库连接 URL (同步)"""
+        """Build PostgreSQL database connection URL (synchronous)"""
         return f"postgresql://{self.POSTGRES_USER}:{self.POSTGRES_PASSWORD}@{self.POSTGRES_HOST}:{self.POSTGRES_PORT}/{self.POSTGRES_DB}"
     
     @property
     def async_database_url(self) -> str:
-        """构建 PostgreSQL 异步数据库连接 URL"""
+        """Build PostgreSQL asynchronous database connection URL"""
         return f"postgresql+asyncpg://{self.POSTGRES_USER}:{self.POSTGRES_PASSWORD}@{self.POSTGRES_HOST}:{self.POSTGRES_PORT}/{self.POSTGRES_DB}"
     
     @property
     def redis_url(self) -> str:
-        """构建 Redis 连接 URL"""
+        """Build Redis connection URL"""
         return f"redis://{self.REDIS_HOST}:{self.REDIS_PORT}/{self.REDIS_DB}"
     
     class Config:

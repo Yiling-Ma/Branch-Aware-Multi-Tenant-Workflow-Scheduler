@@ -1,0 +1,452 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Scheduler Dashboard - Observability</title>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
+            background: #0f1419;
+            color: #e0e0e0;
+            padding: 20px;
+        }
+        
+        .container {
+            max-width: 1400px;
+            margin: 0 auto;
+        }
+        
+        h1 {
+            color: #5c7cfa;
+            margin-bottom: 30px;
+            font-size: 32px;
+        }
+        
+        .stats-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+            gap: 20px;
+            margin-bottom: 30px;
+        }
+        
+        .stat-card {
+            background: #1a1d29;
+            border: 1px solid #2f3342;
+            border-radius: 8px;
+            padding: 20px;
+        }
+        
+        .stat-label {
+            color: #888;
+            font-size: 14px;
+            margin-bottom: 8px;
+        }
+        
+        .stat-value {
+            color: #e0e0e0;
+            font-size: 32px;
+            font-weight: bold;
+        }
+        
+        .stat-unit {
+            color: #888;
+            font-size: 14px;
+            margin-left: 5px;
+        }
+        
+        .chart-container {
+            background: #1a1d29;
+            border: 1px solid #2f3342;
+            border-radius: 8px;
+            padding: 20px;
+            margin-bottom: 30px;
+        }
+        
+        .chart-title {
+            color: #e0e0e0;
+            font-size: 18px;
+            margin-bottom: 20px;
+        }
+        
+        .branch-queue {
+            background: #1a1d29;
+            border: 1px solid #2f3342;
+            border-radius: 8px;
+            padding: 20px;
+            margin-bottom: 30px;
+        }
+        
+        .branch-item {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 10px;
+            border-bottom: 1px solid #2f3342;
+        }
+        
+        .branch-item:last-child {
+            border-bottom: none;
+        }
+        
+        .branch-name {
+            color: #5c7cfa;
+            font-weight: bold;
+        }
+        
+        .branch-stats {
+            display: flex;
+            gap: 20px;
+        }
+        
+        .status-badge {
+            padding: 4px 12px;
+            border-radius: 4px;
+            font-size: 12px;
+            font-weight: bold;
+        }
+        
+        .status-pending { background: #f39c12; color: #000; }
+        .status-queued { background: #3498db; color: #fff; }
+        .status-running { background: #2ecc71; color: #000; }
+        
+        .refresh-btn {
+            background: #5c7cfa;
+            color: white;
+            border: none;
+            padding: 10px 20px;
+            border-radius: 6px;
+            cursor: pointer;
+            font-size: 14px;
+            margin-bottom: 20px;
+        }
+        
+        .refresh-btn:hover {
+            background: #4a6cf5;
+        }
+        
+        .auto-refresh {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            margin-bottom: 20px;
+        }
+        
+        .auto-refresh input {
+            width: 20px;
+            height: 20px;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>📊 Scheduler Observability Dashboard</h1>
+        
+        <div class="auto-refresh">
+            <input type="checkbox" id="autoRefresh" checked>
+            <label for="autoRefresh">Auto-refresh (5s)</label>
+            <button class="refresh-btn" onclick="refreshData()">🔄 Refresh Now</button>
+        </div>
+        
+        <div class="stats-grid">
+            <div class="stat-card">
+                <div class="stat-label">Queue Depth (PENDING)</div>
+                <div class="stat-value" id="pending-count">0</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-label">Queue Depth (QUEUED)</div>
+                <div class="stat-value" id="queued-count">0</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-label">Active Jobs (RUNNING)</div>
+                <div class="stat-value" id="running-count">0</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-label">Active Users</div>
+                <div class="stat-value" id="active-users">0</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-label">Waiting Users</div>
+                <div class="stat-value" id="waiting-users">0</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-label">Avg Job Latency</div>
+                <div class="stat-value" id="avg-latency">0<span class="stat-unit">s</span></div>
+            </div>
+        </div>
+        
+        <div class="chart-container">
+            <div class="chart-title">Job Latency Over Time (Last 5 Minutes)</div>
+            <canvas id="latencyChart"></canvas>
+        </div>
+        
+        <div class="chart-container">
+            <div class="chart-title">Queue Depth Over Time</div>
+            <canvas id="queueChart"></canvas>
+        </div>
+        
+        <div class="branch-queue">
+            <div class="chart-title">Per-Branch Queue Depth</div>
+            <div id="branch-list"></div>
+        </div>
+    </div>
+    
+    <script>
+        const API_BASE = 'http://127.0.0.1:8000';
+        const METRICS_URL = `${API_BASE}/metrics`;
+        
+        // Charts
+        let latencyChart = null;
+        let queueChart = null;
+        
+        // Data storage
+        const latencyData = [];
+        const queueData = { pending: [], queued: [], running: [] };
+        const maxDataPoints = 60; // 5 minutes at 5s intervals
+        
+        // Initialize charts
+        function initCharts() {
+            const latencyCtx = document.getElementById('latencyChart').getContext('2d');
+            latencyChart = new Chart(latencyCtx, {
+                type: 'line',
+                data: {
+                    labels: [],
+                    datasets: [{
+                        label: 'Avg Latency (s)',
+                        data: [],
+                        borderColor: '#5c7cfa',
+                        backgroundColor: 'rgba(92, 124, 250, 0.1)',
+                        tension: 0.4
+                    }]
+                },
+                options: {
+                    responsive: true,
+                    maintainAspectRatio: true,
+                    scales: {
+                        y: {
+                            beginAtZero: true,
+                            ticks: { color: '#888' },
+                            grid: { color: '#2f3342' }
+                        },
+                        x: {
+                            ticks: { color: '#888' },
+                            grid: { color: '#2f3342' }
+                        }
+                    },
+                    plugins: {
+                        legend: {
+                            labels: { color: '#e0e0e0' }
+                        }
+                    }
+                }
+            });
+            
+            const queueCtx = document.getElementById('queueChart').getContext('2d');
+            queueChart = new Chart(queueCtx, {
+                type: 'line',
+                data: {
+                    labels: [],
+                    datasets: [
+                        {
+                            label: 'PENDING',
+                            data: [],
+                            borderColor: '#f39c12',
+                            backgroundColor: 'rgba(243, 156, 18, 0.1)',
+                            tension: 0.4
+                        },
+                        {
+                            label: 'QUEUED',
+                            data: [],
+                            borderColor: '#3498db',
+                            backgroundColor: 'rgba(52, 152, 219, 0.1)',
+                            tension: 0.4
+                        },
+                        {
+                            label: 'RUNNING',
+                            data: [],
+                            borderColor: '#2ecc71',
+                            backgroundColor: 'rgba(46, 204, 113, 0.1)',
+                            tension: 0.4
+                        }
+                    ]
+                },
+                options: {
+                    responsive: true,
+                    maintainAspectRatio: true,
+                    scales: {
+                        y: {
+                            beginAtZero: true,
+                            ticks: { color: '#888' },
+                            grid: { color: '#2f3342' }
+                        },
+                        x: {
+                            ticks: { color: '#888' },
+                            grid: { color: '#2f3342' }
+                        }
+                    },
+                    plugins: {
+                        legend: {
+                            labels: { color: '#e0e0e0' }
+                        }
+                    }
+                }
+            });
+        }
+        
+        // Parse Prometheus metrics
+        function parsePrometheusMetrics(text) {
+            const metrics = {};
+            const lines = text.split('\n');
+            
+            for (const line of lines) {
+                if (line.startsWith('#') || !line.trim()) continue;
+                
+                const match = line.match(/^(\w+)(?:\{([^}]+)\})?\s+([\d.]+)/);
+                if (match) {
+                    const [, name, labels, value] = match;
+                    const key = labels ? `${name}{${labels}}` : name;
+                    metrics[key] = parseFloat(value);
+                }
+            }
+            
+            return metrics;
+        }
+        
+        // Extract metrics
+        function extractMetrics(metrics) {
+            const result = {
+                pending: metrics['scheduler_queue_depth{status="PENDING"}'] || 0,
+                queued: metrics['scheduler_queue_depth{status="QUEUED"}'] || 0,
+                running: metrics['scheduler_queue_depth{status="RUNNING"}'] || 0,
+                activeUsers: metrics['scheduler_active_users'] || 0,
+                waitingUsers: metrics['scheduler_waiting_users'] || 0,
+                avgLatency: 0,
+                branchQueues: {}
+            };
+            
+            // Calculate average latency from histogram
+            const latencyBuckets = [];
+            for (const key in metrics) {
+                if (key.startsWith('job_latency_seconds_bucket')) {
+                    latencyBuckets.push(metrics[key]);
+                }
+            }
+            if (latencyBuckets.length > 0) {
+                result.avgLatency = latencyBuckets.reduce((a, b) => a + b, 0) / latencyBuckets.length;
+            }
+            
+            // Extract branch queue depths
+            for (const key in metrics) {
+                const match = key.match(/scheduler_branch_queue_depth\{branch_id="([^"]+)",status="([^"]+)"\}/);
+                if (match) {
+                    const [, branchId, status] = match;
+                    if (!result.branchQueues[branchId]) {
+                        result.branchQueues[branchId] = {};
+                    }
+                    result.branchQueues[branchId][status] = metrics[key];
+                }
+            }
+            
+            return result;
+        }
+        
+        // Update UI
+        function updateUI(data) {
+            document.getElementById('pending-count').textContent = data.pending;
+            document.getElementById('queued-count').textContent = data.queued;
+            document.getElementById('running-count').textContent = data.running;
+            document.getElementById('active-users').textContent = data.activeUsers;
+            document.getElementById('waiting-users').textContent = data.waitingUsers;
+            document.getElementById('avg-latency').innerHTML = data.avgLatency.toFixed(2) + '<span class="stat-unit">s</span>';
+            
+            // Update charts
+            const now = new Date().toLocaleTimeString();
+            
+            // Latency chart
+            latencyData.push(data.avgLatency);
+            if (latencyData.length > maxDataPoints) latencyData.shift();
+            latencyChart.data.labels = Array.from({ length: latencyData.length }, (_, i) => '');
+            latencyChart.data.datasets[0].data = latencyData;
+            latencyChart.update('none');
+            
+            // Queue chart
+            queueData.pending.push(data.pending);
+            queueData.queued.push(data.queued);
+            queueData.running.push(data.running);
+            if (queueData.pending.length > maxDataPoints) {
+                queueData.pending.shift();
+                queueData.queued.shift();
+                queueData.running.shift();
+            }
+            queueChart.data.labels = Array.from({ length: queueData.pending.length }, (_, i) => '');
+            queueChart.data.datasets[0].data = queueData.pending;
+            queueChart.data.datasets[1].data = queueData.queued;
+            queueChart.data.datasets[2].data = queueData.running;
+            queueChart.update('none');
+            
+            // Branch queues
+            const branchList = document.getElementById('branch-list');
+            branchList.innerHTML = '';
+            for (const [branchId, statuses] of Object.entries(data.branchQueues)) {
+                const branchItem = document.createElement('div');
+                branchItem.className = 'branch-item';
+                
+                const pending = statuses.PENDING || 0;
+                const queued = statuses.QUEUED || 0;
+                const running = statuses.RUNNING || 0;
+                
+                branchItem.innerHTML = `
+                    <div class="branch-name">${branchId}</div>
+                    <div class="branch-stats">
+                        <span class="status-badge status-pending">PENDING: ${pending}</span>
+                        <span class="status-badge status-queued">QUEUED: ${queued}</span>
+                        <span class="status-badge status-running">RUNNING: ${running}</span>
+                    </div>
+                `;
+                branchList.appendChild(branchItem);
+            }
+        }
+        
+        // Fetch metrics
+        async function refreshData() {
+            try {
+                const response = await fetch(METRICS_URL);
+                const text = await response.text();
+                const metrics = parsePrometheusMetrics(text);
+                const data = extractMetrics(metrics);
+                updateUI(data);
+            } catch (error) {
+                console.error('Failed to fetch metrics:', error);
+            }
+        }
+        
+        // Auto-refresh
+        let autoRefreshInterval = null;
+        document.getElementById('autoRefresh').addEventListener('change', (e) => {
+            if (e.target.checked) {
+                autoRefreshInterval = setInterval(refreshData, 5000);
+            } else {
+                if (autoRefreshInterval) {
+                    clearInterval(autoRefreshInterval);
+                    autoRefreshInterval = null;
+                }
+            }
+        });
+        
+        // Initialize
+        initCharts();
+        refreshData();
+        if (document.getElementById('autoRefresh').checked) {
+            autoRefreshInterval = setInterval(refreshData, 5000);
+        }
+    </script>
+</body>
+</html>
+

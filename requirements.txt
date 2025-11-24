@@ -12,4 +12,8 @@ redis
 numpy
 opencv-python
 openslide-python
-instanseg-torch
+instanseg-torch[full]
+torch
+requests
+shapely
+zarr
