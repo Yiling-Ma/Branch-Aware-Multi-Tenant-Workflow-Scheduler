@@ -25,11 +25,19 @@ from starlette.responses import StreamingResponse, Response, FileResponse
 from instanseg import InstanSeg
 import torch
 from openslide.deepzoom import DeepZoomGenerator  # Core component
+from app.metrics import metrics, get_metrics, get_metrics_content_type
+from app.rate_limit import init_rate_limiter, get_rate_limiter
+from fastapi.responses import Response as FastAPIResponse
 
 # Default image path (consistent with worker.py)
 DEFAULT_IMAGE = "/Users/yiling/Desktop/penn_proj/my-scheduler/data/CMU-1-Small-Region.svs"
 
 app = FastAPI()
+
+# Initialize rate limiter on startup
+@app.on_event("startup")
+async def startup_event():
+    await init_rate_limiter()
 
 # Preload model for real-time verification (load at startup for faster response)
 # Note: This will consume GPU memory; can be changed to lazy loading if memory is tight
@@ -46,6 +54,126 @@ except Exception as e:
 async def root():
     """Root path redirects to frontend UI"""
     return RedirectResponse(url="/static/index.html")
+
+# Prometheus metrics endpoint
+@app.get("/metrics")
+async def metrics_endpoint():
+    """Prometheus metrics endpoint"""
+    from app.metrics import get_metrics, get_metrics_content_type
+    from fastapi.responses import Response as FastAPIResponse
+    return FastAPIResponse(
+        content=get_metrics(),
+        media_type=get_metrics_content_type()
+    )
+
+# Dashboard metrics API endpoint
+@app.get("/api/metrics")
+async def dashboard_metrics(session: AsyncSession = Depends(get_session)):
+    """Get metrics for observability dashboard"""
+    from sqlalchemy import func, and_, or_
+    from datetime import datetime, timedelta
+    from sqlalchemy.sql import select as sa_select
+    
+    try:
+        # Get queue depth by status - use SQLAlchemy select for aggregation
+        pending_stmt = sa_select(func.count(Job.id)).where(Job.status == "PENDING")
+        pending_result = await session.execute(pending_stmt)
+        pending_count = pending_result.scalar() or 0
+        
+        queued_stmt = sa_select(func.count(Job.id)).where(Job.status == "QUEUED")
+        queued_result = await session.execute(queued_stmt)
+        queued_count = queued_result.scalar() or 0
+        
+        # Get queue depth by branch
+        branch_queue = {}
+        for status in ["PENDING", "QUEUED"]:
+            stmt = sa_select(Job.branch_id, func.count(Job.id)).where(
+                Job.status == status
+            ).group_by(Job.branch_id)
+            result = await session.execute(stmt)
+            for branch_id, count in result:
+                if branch_id not in branch_queue:
+                    branch_queue[branch_id] = {}
+                branch_queue[branch_id][status] = count
+        
+        # Get active jobs by status
+        running_stmt = sa_select(func.count(Job.id)).where(Job.status == "RUNNING")
+        running_result = await session.execute(running_stmt)
+        running_total = running_result.scalar() or 0
+        
+        # Get active jobs by worker (simplified: count by job_type)
+        active_by_type = {}
+        stmt = sa_select(Job.job_type, func.count(Job.id)).where(
+            Job.status.in_(["RUNNING", "QUEUED"])
+        ).group_by(Job.job_type)
+        result = await session.execute(stmt)
+        for job_type, count in result:
+            active_by_type[job_type] = count
+        
+        # Get active users count
+        import redis.asyncio as redis
+        from app.core.config import settings
+        try:
+            r = redis.from_url(settings.redis_url, decode_responses=True)
+            active_users_count = await r.scard("active_users")
+            await r.aclose()
+        except Exception as e:
+            print(f"⚠️  Redis error in metrics: {e}")
+            active_users_count = 0
+        
+        # Get average job latency for last 10 minutes (from completed jobs)
+        # Query jobs that completed in the last 10 minutes
+        ten_minutes_ago = datetime.utcnow() - timedelta(minutes=10)
+        
+        # Get completed jobs from last 10 minutes
+        # Note: We use created_at as approximation since we don't have completion timestamp
+        # For more accurate latency, we could add a completed_at field or query Prometheus metrics
+        latency_by_type = {}
+        for job_type in ["cell_segmentation", "tissue_mask"]:
+            # Get all completed jobs of this type from last 10 minutes
+            stmt = sa_select(Job.created_at).where(
+                and_(
+                    Job.job_type == job_type,
+                    Job.status == "SUCCEEDED",
+                    Job.created_at >= ten_minutes_ago
+                )
+            ).order_by(Job.created_at.desc()).limit(100)  # Get up to 100 recent jobs
+            result = await session.execute(stmt)
+            jobs = result.scalars().all()
+            
+            if jobs:
+                # Calculate average latency (time from creation to now)
+                # This is an approximation - actual latency would be from start to completion
+                now = datetime.utcnow()
+                latencies = [(now - job_created).total_seconds() for job_created in jobs]
+                avg_latency = sum(latencies) / len(latencies)
+                latency_by_type[job_type] = round(avg_latency, 2)
+            else:
+                latency_by_type[job_type] = None
+        
+        # Also try to get from Prometheus metrics if available
+        # For now, we'll use the database approximation above
+        
+        return {
+            "queue_depth": {
+                "PENDING": pending_count,
+                "QUEUED": queued_count,
+                "total": pending_count + queued_count
+            },
+            "queue_depth_by_branch": branch_queue,
+            "active_jobs": {
+                "RUNNING": running_total,
+                "total": running_total + queued_count
+            },
+            "active_jobs_by_type": active_by_type,
+            "active_users": active_users_count,
+            "latency_by_type": latency_by_type,
+            "timestamp": datetime.utcnow().isoformat()
+        }
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Error fetching metrics: {str(e)}")
 
 # 1. Configure CORS (allow frontend access)
 app.add_middleware(
@@ -109,6 +237,121 @@ async def get_all_users(session: AsyncSession = Depends(get_session)):
     result = await session.exec(statement)
     users = result.all()
     return users
+
+@app.delete("/users/{user_id}")
+async def delete_user(
+    user_id: UUID,
+    session: AsyncSession = Depends(get_session)
+):
+    """
+    Delete a user and all associated data.
+    This will:
+    - Delete all workflows and jobs for this user (cascade delete)
+    - Delete user's file directory (user_files/{user_id}/)
+    - Remove user from Redis (active_users, waiting_users, user_activity)
+    - Delete user record from database
+    """
+    # Verify user exists
+    user_statement = select(User).where(User.id == user_id)
+    user_result = await session.exec(user_statement)
+    user = user_result.first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    
+    try:
+        # 1. Delete all workflows and jobs (must delete jobs first due to foreign key constraints)
+        from sqlalchemy import and_
+        workflows_stmt = select(Workflow).where(Workflow.user_id == user_id)
+        workflows_result = await session.exec(workflows_stmt)
+        workflows = workflows_result.all()
+        
+        deleted_workflows_count = 0
+        deleted_jobs_count = 0
+        
+        # First, collect all jobs and delete them (including their static files)
+        for workflow in workflows:
+            # Get all jobs for this workflow
+            jobs_stmt = select(Job).where(Job.workflow_id == workflow.id)
+            jobs_result = await session.exec(jobs_stmt)
+            jobs = jobs_result.all()
+            
+            for job in jobs:
+                # Delete job's static files directory if exists
+                job_static_dir = os.path.join("static", str(job.id))
+                if os.path.exists(job_static_dir):
+                    try:
+                        shutil.rmtree(job_static_dir)
+                        print(f"🗑️  Deleted job static directory: {job_static_dir}")
+                    except Exception as e:
+                        print(f"⚠️  Error deleting job static directory {job_static_dir}: {e}")
+                
+                # Delete job from database
+                await session.delete(job)
+                deleted_jobs_count += 1
+            
+            deleted_workflows_count += 1
+        
+        # Now delete workflows (jobs are already deleted)
+        for workflow in workflows:
+            await session.delete(workflow)
+        
+        # 2. Delete user's file directory
+        user_files_dir = get_user_files_dir(user_id)
+        if os.path.exists(user_files_dir):
+            try:
+                shutil.rmtree(user_files_dir)
+                print(f"🗑️  Deleted user files directory: {user_files_dir}")
+            except Exception as e:
+                print(f"⚠️  Error deleting user files directory {user_files_dir}: {e}")
+        
+        # 3. Remove user from Redis
+        try:
+            import redis.asyncio as redis
+            from app.core.config import settings
+            r = redis.from_url(settings.redis_url, decode_responses=True)
+            user_id_str = str(user_id)
+            
+            # Remove from active_users
+            await r.srem("active_users", user_id_str)
+            
+            # Remove from waiting_users queue
+            # We need to rebuild the queue without this user
+            waiting_users = await r.lrange("waiting_users", 0, -1)
+            if user_id_str in waiting_users:
+                await r.delete("waiting_users")
+                for uid in waiting_users:
+                    if uid != user_id_str:
+                        await r.rpush("waiting_users", uid)
+            
+            # Remove user activity record
+            await r.delete(f"user_activity:{user_id_str}")
+            
+            # Remove rate limit keys
+            rate_limit_keys = await r.keys(f"rate_limit:*:{user_id_str}")
+            for key in rate_limit_keys:
+                await r.delete(key)
+            
+            await r.aclose()
+            print(f"🗑️  Removed user {user_id_str} from Redis")
+        except Exception as e:
+            print(f"⚠️  Error removing user from Redis: {e}")
+        
+        # 4. Delete user record from database
+        await session.delete(user)
+        await session.commit()
+        
+        return {
+            "message": "User deleted successfully",
+            "user_id": str(user_id),
+            "username": user.username,
+            "deleted_workflows": deleted_workflows_count,
+            "deleted_jobs": deleted_jobs_count
+        }
+    except Exception as e:
+        await session.rollback()
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Error deleting user: {str(e)}")
 
 # --- User File Management ---
 USER_FILES_DIR = "user_files"
@@ -407,78 +650,154 @@ async def create_workflow(
     x_user_id: str = Header(..., alias="X-User-ID"),  # Require header
     session: AsyncSession = Depends(get_session)
 ):
-    # Use ID from header
     try:
-        user_id = UUID(x_user_id)
-    except ValueError:
-        raise HTTPException(status_code=400, detail="Invalid user ID format")
-    
-    # Verify user exists
-    user_statement = select(User).where(User.id == user_id)
-    user_result = await session.exec(user_statement)
-    user = user_result.first()
-    if not user:
-        raise HTTPException(status_code=404, detail=f"User with ID {user_id} not found. Please create the user first.")
-    
-    # 1. Create Workflow
-    new_workflow = Workflow(user_id=user_id)
-    session.add(new_workflow)
-    await session.commit()
-    await session.refresh(new_workflow)
-    
-    # 2. Create Jobs and parse dependencies
-    # Since Jobs haven't been saved to database yet and don't have IDs, we use list indices to temporarily store dependencies
-    created_jobs = []
-    
-    for index, job_in in enumerate(workflow_data.jobs):
-        # Debug: print image_path
-        print(f"📁 Creating job with image_path: {job_in.image_path}")
-        print(f"📁 Job data received: name={job_in.name}, job_type={job_in.job_type}, branch_id={job_in.branch_id}, image_path={job_in.image_path}")
+        # Use ID from header
+        try:
+            user_id = UUID(x_user_id)
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Invalid user ID format")
         
-        job = Job(
-            workflow_id=new_workflow.id,
-            name=job_in.name,
-            job_type=job_in.job_type,
-            branch_id=job_in.branch_id,
-            status="PENDING",
-            image_path=job_in.image_path  # Save custom image path
+        # Rate limiting: Check per-user rate limit
+        try:
+            limiter = await get_rate_limiter()
+            if limiter:
+                allowed = await limiter.check_rate_limit("create_workflow", x_user_id)
+                metrics.record_rate_limit("create_workflow", allowed)
+                if not allowed:
+                    raise HTTPException(
+                        status_code=429, 
+                        detail="Rate limit exceeded. Please try again later.",
+                        headers={"Retry-After": "1"}
+                    )
+        except HTTPException:
+            raise  # Re-raise HTTP exceptions
+        except Exception as e:
+            print(f"⚠️  Rate limiter error (allowing request): {e}")
+            # Fail open: if rate limiter fails, allow the request
+        
+        # Verify user exists
+        user_statement = select(User).where(User.id == user_id)
+        user_result = await session.exec(user_statement)
+        user = user_result.first()
+        if not user:
+            raise HTTPException(status_code=404, detail=f"User with ID {user_id} not found. Please create the user first.")
+        
+        # Rate limiting: Check per-user concurrent job limit
+        from app.core.config import settings
+        from sqlalchemy import func, and_
+        from sqlalchemy.sql import select as sa_select
+        
+        # Count user's active jobs (PENDING, QUEUED, RUNNING)
+        try:
+            active_jobs_stmt = sa_select(func.count(Job.id)).join(Workflow).where(
+                and_(
+                    Workflow.user_id == user_id,
+                    Job.status.in_(["PENDING", "QUEUED", "RUNNING"])
+                )
+            )
+            active_jobs_result = await session.execute(active_jobs_stmt)
+            active_jobs_count = active_jobs_result.scalar() or 0
+        except Exception as e:
+            # If query fails, log error but don't block the request
+            print(f"⚠️  Error checking active jobs count: {e}")
+            import traceback
+            traceback.print_exc()
+            active_jobs_count = 0  # Fail open: allow request if check fails
+        
+        # Check if adding new jobs would exceed limit
+        new_jobs_count = len(workflow_data.jobs)
+        max_jobs_per_user = getattr(settings, 'MAX_JOBS_PER_USER', 50)
+        
+        if active_jobs_count + new_jobs_count > max_jobs_per_user:
+            raise HTTPException(
+                status_code=429,
+                detail=f"Job limit exceeded. You have {active_jobs_count} active jobs. Maximum allowed: {max_jobs_per_user}. This request would add {new_jobs_count} more jobs.",
+                headers={"Retry-After": "60"}
+            )
+        
+        # 1. Create Workflow
+        new_workflow = Workflow(user_id=user_id)
+        session.add(new_workflow)
+        await session.commit()
+        await session.refresh(new_workflow)
+        
+        # 2. Create Jobs and parse dependencies
+        # Since Jobs haven't been saved to database yet and don't have IDs, we use list indices to temporarily store dependencies
+        created_jobs = []
+        
+        for index, job_in in enumerate(workflow_data.jobs):
+            # Debug: print image_path
+            print(f"📁 Creating job with image_path: {job_in.image_path}")
+            print(f"📁 Job data received: name={job_in.name}, job_type={job_in.job_type}, branch_id={job_in.branch_id}, image_path={job_in.image_path}")
+            
+            job = Job(
+                workflow_id=new_workflow.id,
+                name=job_in.name,
+                job_type=job_in.job_type,
+                branch_id=job_in.branch_id,
+                status="PENDING",
+                image_path=job_in.image_path  # Save custom image path
+            )
+            session.add(job)
+            # Temporarily flush to get ID, but don't commit
+            await session.flush()
+            await session.refresh(job)
+            
+            print(f"📁 Job created with image_path: {job.image_path}")
+            print(f"📁 Job ID: {job.id}")
+            print(f"📁 Verifying image_path attribute exists: {hasattr(job, 'image_path')}")
+            if hasattr(job, 'image_path'):
+                print(f"📁 image_path value: '{job.image_path}'")
+            else:
+                print(f"⚠️  WARNING: image_path attribute not found on job object!")
+            
+            created_jobs.append(job)
+        
+        # 3. Second pass: Fill in parent_ids (now everyone has IDs)
+        for index, job_in in enumerate(workflow_data.jobs):
+            parent_uuids = []
+            for parent_idx in job_in.parent_indices:
+                if parent_idx < index:  # Prevent circular dependencies
+                    parent_uuids.append(str(created_jobs[parent_idx].id))
+            
+            # Update Job in database
+            created_jobs[index].parent_ids_json = json.dumps(parent_uuids)
+            session.add(created_jobs[index])
+        
+        await session.commit()
+        
+        # Update metrics
+        try:
+            metrics.increment_workflow_counter("PENDING")
+            for job in created_jobs:
+                metrics.increment_job_counter(job.job_type, "PENDING")
+        except Exception as e:
+            print(f"⚠️  Error updating metrics: {e}")
+        
+        # Update user activity time (for timeout detection)
+        try:
+            import redis.asyncio as redis
+            from app.core.config import settings
+            r = redis.from_url(settings.redis_url, decode_responses=True)
+            import time
+            await r.set(f"user_activity:{x_user_id}", str(time.time()), ex=600)  # 10 minutes expiration
+            await r.aclose()
+        except Exception as e:
+            print(f"⚠️  Error updating user activity: {e}")
+        
+        return {"workflow_id": new_workflow.id, "job_count": len(created_jobs)}
+    
+    except HTTPException:
+        raise  # Re-raise HTTP exceptions
+    except Exception as e:
+        import traceback
+        error_msg = f"Error creating workflow: {str(e)}"
+        print(f"💥 {error_msg}")
+        traceback.print_exc()
+        raise HTTPException(
+            status_code=500,
+            detail=error_msg
         )
-        session.add(job)
-        # Temporarily flush to get ID, but don't commit
-        await session.flush()
-        await session.refresh(job)
-        
-        print(f"📁 Job created with image_path: {job.image_path}")
-        print(f"📁 Job ID: {job.id}")
-        print(f"📁 Verifying image_path attribute exists: {hasattr(job, 'image_path')}")
-        if hasattr(job, 'image_path'):
-            print(f"📁 image_path value: '{job.image_path}'")
-        else:
-            print(f"⚠️  WARNING: image_path attribute not found on job object!")
-        
-        created_jobs.append(job)
-    
-    # 3. Second pass: Fill in parent_ids (now everyone has IDs)
-    for index, job_in in enumerate(workflow_data.jobs):
-        parent_uuids = []
-        for parent_idx in job_in.parent_indices:
-            if parent_idx < index:  # Prevent circular dependencies
-                parent_uuids.append(str(created_jobs[parent_idx].id))
-        
-        # Update Job in database
-        created_jobs[index].parent_ids_json = json.dumps(parent_uuids)
-        session.add(created_jobs[index])
-        
-    await session.commit()
-    
-    # Update user activity time (for timeout detection)
-    import redis.asyncio as redis
-    from app.core.config import settings
-    r = redis.from_url(settings.redis_url, decode_responses=True)
-    import time
-    await r.set(f"user_activity:{x_user_id}", str(time.time()), ex=600)  # 10 minutes expiration
-    
-    return {"workflow_id": new_workflow.id, "job_count": len(created_jobs)}
 
 # --- New: View all Workflows ---
 @app.get("/workflows/")

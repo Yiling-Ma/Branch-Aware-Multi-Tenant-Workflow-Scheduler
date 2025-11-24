@@ -2,6 +2,12 @@
 
 A distributed task scheduling system for Whole Slide Image (WSI) cell segmentation with branch-aware parallel execution and multi-tenant isolation.
 
+## Demo
+
+📹 **Demo Video**: [Watch the demo video](https://github.com/YOUR_USERNAME/YOUR_REPO/releases/latest) (available in Releases)
+
+> **Note**: Replace `YOUR_USERNAME` and `YOUR_REPO` with your actual GitHub username and repository name. The demo video is available in the latest release.
+
 ## Quick Start
 
 ### Prerequisites
@@ -23,17 +29,30 @@ A distributed task scheduling system for Whole Slide Image (WSI) cell segmentati
    pip install -r requirements.txt
    ```
 
-3. **Pre-download models** (optional)
+3. **Download test data** (optional)
+   ```bash
+   # Download sample WSI files for testing
+   ./download_data.sh
+   ```
+   
+   Or manually download from: [OpenSlide Test Data](https://openslide.cs.cmu.edu/download/openslide-testdata/Aperio/)
+   
+   Recommended test files:
+   - `CMU-1-Small-Region.svs` (1.85 MB) - Small, fast for testing
+   - `CMU-1.svs` (169.33 MB) - Medium size
+   - `CMU-2.svs` (372.65 MB) - Large file
+
+4. **Pre-download models** (optional)
    ```bash
    python download_model.py
    ```
 
-4. **Start services**
+5. **Start services**
    ```bash
    ./start_server.sh 4  # Starts scheduler, 4 workers, and API server
    ```
 
-5. **Open UI**
+6. **Open UI**
    - Web Interface: http://127.0.0.1:8000/
    - API Docs (Swagger): http://127.0.0.1:8000/docs
 
@@ -58,8 +77,9 @@ A distributed task scheduling system for Whole Slide Image (WSI) cell segmentati
 
 ### 2. Upload Input Files
 - In File Manager, select your user
-- Upload `.svs` image files
+- Upload `.svs` image files (Whole Slide Images)
 - Files are stored in `user_files/{user_id}/inputs/`
+- **Test Data**: Download sample WSI files from [OpenSlide Test Data](https://openslide.cs.cmu.edu/download/openslide-testdata/Aperio/)
 
 ### 3. Create Job
 - Open "Test Scheduler" → "Create Custom Job"
@@ -191,6 +211,33 @@ my-scheduler/
 ├── user_files/          # User data (persistent)
 ├── docker-compose.yml   # Docker services
 └── start_server.sh      # Start script
+```
+
+## Test Data
+
+Sample Whole Slide Image (WSI) files for testing can be downloaded from:
+
+🔗 **[OpenSlide Test Data - Aperio](https://openslide.cs.cmu.edu/download/openslide-testdata/Aperio/)**
+
+### Recommended Test Files
+
+| File | Size | Description |
+|------|------|-------------|
+| `CMU-1-Small-Region.svs` | 1.85 MB | Small region, fast for testing |
+| `CMU-1.svs` | 169.33 MB | Medium size, brightfield JPEG |
+| `CMU-2.svs` | 372.65 MB | Large file, brightfield JPEG |
+| `JP2K-33003-1.svs` | 60.89 MB | Aorta tissue, JPEG 2000 |
+
+### Quick Download
+
+```bash
+# Use the provided script
+./download_data.sh
+
+# Or download manually
+mkdir -p data
+curl -L -o data/CMU-1-Small-Region.svs \
+  https://openslide.cs.cmu.edu/download/openslide-testdata/Aperio/CMU-1-Small-Region.svs
 ```
 
 ## Features

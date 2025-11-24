@@ -17,3 +17,4 @@ torch
 requests
 shapely
 zarr
+prometheus-client

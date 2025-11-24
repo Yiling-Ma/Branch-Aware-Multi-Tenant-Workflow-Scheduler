@@ -17,10 +17,17 @@ from sqlalchemy.orm import selectinload, sessionmaker
 from sqlalchemy import and_, or_
 from sqlmodel.ext.asyncio.session import AsyncSession
 from app.core.config import settings
+from app.metrics import metrics
 
 REDIS_URL = settings.redis_url
 MAX_ACTIVE_USERS = 3
 MAX_WORKERS = settings.MAX_WORKERS
+
+# Semaphore for controlling scheduler concurrency
+# Limits how many jobs can be processed per scheduler tick
+SCHEDULER_SEMAPHORE = asyncio.Semaphore(
+    getattr(settings, 'SCHEDULER_SEMAPHORE_SIZE', 10)
+)
 
 # --- Helper function:Check if branch is busy ---
 async def is_branch_busy(session, branch_id):
@@ -229,6 +236,20 @@ async def run_scheduler():
                 running_jobs = result_running.all()
                 running_count = len(running_jobs)
                 
+                # Update metrics: active jobs
+                running_by_status = {"RUNNING": 0, "QUEUED": 0}
+                for j in running_jobs:
+                    running_by_status[j.status] = running_by_status.get(j.status, 0) + 1
+                metrics.update_active_jobs_total(running_by_status)
+                
+                # Update metrics: branch jobs running
+                branch_running = {}
+                for j in running_jobs:
+                    if j.status == "RUNNING":
+                        branch_running[j.branch_id] = branch_running.get(j.branch_id, 0) + 1
+                for branch_id, count in branch_running.items():
+                    metrics.update_branch_jobs_running(branch_id, count)
+                
                 # ✅ Debug information: Show currently running tasks and branches
                 if running_count > 0:
                     branch_info = {}
@@ -267,6 +288,31 @@ async def run_scheduler():
                     Job.status == "PENDING"
                 ).order_by(Job.created_at)
                 result_pending = await session.exec(statement_pending)
+                
+                # Update metrics: queue depth
+                pending_jobs_list = result_pending.all()
+                pending_count = len(pending_jobs_list)
+                queued_count = sum(1 for j in running_jobs if j.status == "QUEUED")
+                
+                # Calculate branch queue depth
+                branch_queue_counts = {}
+                for job in pending_jobs_list:
+                    if job.branch_id not in branch_queue_counts:
+                        branch_queue_counts[job.branch_id] = {"PENDING": 0, "QUEUED": 0}
+                    branch_queue_counts[job.branch_id]["PENDING"] += 1
+                for job in running_jobs:
+                    if job.status == "QUEUED":
+                        if job.branch_id not in branch_queue_counts:
+                            branch_queue_counts[job.branch_id] = {"PENDING": 0, "QUEUED": 0}
+                        branch_queue_counts[job.branch_id]["QUEUED"] += 1
+                
+                metrics.update_queue_depth(
+                    {"PENDING": pending_count, "QUEUED": queued_count},
+                    branch_queue_counts
+                )
+                
+                # Re-execute query for processing
+                result_pending = await session.exec(statement_pending)
                 pending_jobs = result_pending.all()
                 
                 # ✅ Additional filtering:Ensure no CANCELLED status tasks(double insurance)
@@ -276,7 +322,14 @@ async def run_scheduler():
                 pending_jobs = [j for j in pending_jobs if j.status == "PENDING"]
                 
                 if pending_jobs:
-                    print(f"🔍 Scanned pending tasks(Global FIFO sorting)", flush=True)
+                    print(f"🔍 Scanned {len(pending_jobs)} pending tasks (Global FIFO sorting)", flush=True)
+                    
+                    # Apply semaphore limit: Only process up to semaphore_size jobs per tick
+                    # This prevents scheduler from processing too many jobs at once
+                    semaphore_capacity = getattr(settings, 'SCHEDULER_SEMAPHORE_SIZE', 10)
+                    if len(pending_jobs) > semaphore_capacity:
+                        print(f"   ⚠️  Semaphore limit: Processing {semaphore_capacity}/{len(pending_jobs)} jobs this tick", flush=True)
+                        pending_jobs = pending_jobs[:semaphore_capacity]
                 
                 if not pending_jobs:
                     # No pending tasks,Check if any workflow needs to be marked as completed
@@ -360,30 +413,34 @@ async def run_scheduler():
                     if branch_busy_db:
                         # If database is busy(has RUNNING tasks),memory lock,prevent subsequent tasks from trying
                         active_branches_in_loop.add(job.branch_id) 
-                        print(f"      ⏳ branch {job.branch_id} busy (DB,has RUNNING tasks),Job {job.name} queued...")
+                        print(f"      ⏳ branch {job.branch_id} busy (DB,has RUNNING tasks),Job {job.name} queued...", flush=True)
                         continue
                     
-                    # Debug: Log branch check result
-                    print(f"      ✅ branch {job.branch_id} idle(no RUNNING tasks),Job {job.name} can start")
-                    
-                    # --- , ---
-                    print(f"   ▶️ Start Job: {job.name} (Branch: {job.branch_id}, Workflow: {wf.id})")
-                    print(f"      📊 Current global state: {running_count}/{MAX_WORKERS} workers, {free_slots} ")
-                    
-                    job.status = "QUEUED"  # Change to QUEUED,wait for worker to process
-                    session.add(job)
-                    await session.commit()
-                    
-                    # Update user activity time(when task starts)
-                    await update_user_activity(r, user_id)
-                    
-                    # 🔐 Key:Lock immediately！(prevent duplicate start of same branch within same loop)
-                    # Note:This lock is only valid in current loop,will not prevent tasks from different branches from running in parallel
-                    active_branches_in_loop.add(job.branch_id)
-                    started_this_tick += 1
-                    
-                    # Debug: Show which branches are now active
-                    print(f"      🔒 branch: {job.branch_id} (memory lock)")
+                    # check 5: Semaphore limit (concurrency control for scheduler)
+                    # Acquire semaphore for this job processing
+                    async with SCHEDULER_SEMAPHORE:
+                        # Debug: Log branch check result
+                        print(f"      ✅ branch {job.branch_id} idle(no RUNNING tasks),Job {job.name} can start", flush=True)
+                        
+                        # --- , ---
+                        print(f"   ▶️ Start Job: {job.name} (Branch: {job.branch_id}, Workflow: {wf.id})", flush=True)
+                        print(f"      📊 Current global state: {running_count}/{MAX_WORKERS} workers, {free_slots} available slots", flush=True)
+                        
+                        job.status = "QUEUED"  # Change to QUEUED,wait for worker to process
+                        session.add(job)
+                        await session.commit()
+                        
+                        # Update user activity time(when task starts)
+                        await update_user_activity(r, user_id)
+                        
+                        # 🔐 Key:Lock immediately！(prevent duplicate start of same branch within same loop)
+                        # Note:This lock is only valid in current loop,will not prevent tasks from different branches from running in parallel
+                        active_branches_in_loop.add(job.branch_id)
+                        started_this_tick += 1
+                        
+                        # Debug: Show which branches are now active
+                        print(f"      🔒 branch: {job.branch_id} (memory lock)", flush=True)
+                        # Semaphore will be released automatically when exiting the 'async with' block
                 
                 # Check if all workflows are completed
                 for wf in workflows_dict.values():

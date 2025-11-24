@@ -17,6 +17,8 @@ class Settings(BaseSettings):
     
     # Scheduler configuration
     MAX_WORKERS: int = 4  # Global maximum concurrent worker count
+    MAX_JOBS_PER_USER: int = 50  # Maximum concurrent jobs (PENDING+QUEUED+RUNNING) per user
+    SCHEDULER_SEMAPHORE_SIZE: int = 10  # Maximum jobs scheduler can process per tick
     
     # Worker configuration
     INSTANSEG_MODEL_TYPE: str = "brightfield_nuclei"  # Optional: "brightfield_nuclei", "fluorescence_nuclei", "fluorescence_cells"

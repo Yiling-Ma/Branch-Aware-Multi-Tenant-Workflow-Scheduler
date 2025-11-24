@@ -15,6 +15,8 @@ from sqlmodel.ext.asyncio.session import AsyncSession
 from instanseg import InstanSeg
 from app.core.config import settings
 import shutil
+from app.metrics import metrics
+import time
 
 # --- Configuration ---
 DATA_DIR = "./data"
@@ -254,6 +256,10 @@ def merge_cells_with_nms(cells, iou_threshold=0.3):
 # --- Task type 1: Cell segmentation ---
 async def process_cell_segmentation(job, slide, w, h, coordinates, instanseg, session):
     """Process cell segmentation task"""
+    # Record start time for latency calculation
+    process_cell_segmentation._job_start_time = time.time()
+    process_cell_segmentation._job_created_at = job.created_at.timestamp() if job.created_at else time.time()
+    
     # 🛑 Check if cancelled before starting processing
     job_id = job.id  # Save job_id,avoid object expiration
     if await check_job_cancelled(session, job_id):
@@ -437,6 +443,16 @@ async def process_cell_segmentation(job, slide, w, h, coordinates, instanseg, se
     })
     
     if final_job:
+        # Record metrics: job latency and duration
+        job_end_time = time.time()
+        if hasattr(process_cell_segmentation, '_job_start_time'):
+            latency = job_end_time - process_cell_segmentation._job_start_time
+            metrics.record_job_latency("cell_segmentation", "SUCCEEDED", latency)
+        if hasattr(process_cell_segmentation, '_job_created_at'):
+            duration = job_end_time - process_cell_segmentation._job_created_at
+            metrics.record_job_duration("cell_segmentation", "SUCCEEDED", duration)
+        metrics.increment_job_counter("cell_segmentation", "SUCCEEDED")
+        
         print(f"✅ Cell segmentation complete！detected {len(all_detected_cells)} cells")
         print(f"   ⚠️  Pixel Size used: {PIXEL_SIZE} micrometers per pixel")
         print(f"   🚀 Performance optimization: skipped {skipped_background} background tiles (saved {skipped_background * 100 / len(coordinates):.1f}% processing time)")
@@ -451,6 +467,10 @@ async def process_cell_segmentation(job, slide, w, h, coordinates, instanseg, se
 # --- Task type 2:  ---
 async def process_tissue_mask(job, slide, w, h, coordinates, session):
     """Process tissue mask generation task - Generate binary mask to skip background tiles"""
+    # Record start time for latency calculation
+    process_tissue_mask._job_start_time = time.time()
+    process_tissue_mask._job_created_at = job.created_at.timestamp() if job.created_at else time.time()
+    
     # 🛑 Check if cancelled before starting processing
     job_id = job.id  # Save job_id,avoid object expiration
     if await check_job_cancelled(session, job_id):
@@ -758,11 +778,25 @@ async def run_worker(worker_id=1):
                         saved_image_path = db_image_path.strip()
                         print(f"   📁  image_path: '{saved_image_path}'")
                 
+                # Record job start time for latency calculation
+                job_start_time = time.time()
+                job_created_at = job.created_at.timestamp() if job.created_at else job_start_time
+                
+                # Record job start time for latency calculation
+                job_start_time = time.time()
+                job_created_at = job.created_at.timestamp() if job.created_at else job_start_time
+                
                 #  job  RUNNING( image_path)
                 job = await safe_update_job(session, job.id, {"status": "RUNNING"})
                 if not job:
                     print(f"⚠️   job ,")
                     continue
+                
+                # Update metrics: active jobs
+                metrics.update_active_jobs(worker_id, job.job_type, "RUNNING", 1)
+                
+                # Update metrics: active jobs
+                metrics.update_active_jobs(worker_id, job.job_type, "RUNNING", 1)
                 
                 # ✅  image_path(,)
                 await session.refresh(job)
@@ -844,6 +878,16 @@ async def run_worker(worker_id=1):
                     
                     #  job  FAILED
                     if job_id:
+                        # Record metrics: failed job
+                        job_end_time = time.time()
+                        if 'job_start_time' in locals():
+                            latency = job_end_time - job_start_time
+                            metrics.record_job_latency(job.job_type if job else "unknown", "FAILED", latency)
+                        if 'job_created_at' in locals():
+                            duration = job_end_time - job_created_at
+                            metrics.record_job_duration(job.job_type if job else "unknown", "FAILED", duration)
+                        metrics.increment_job_counter(job.job_type if job else "unknown", "FAILED")
+                        
                         failed_job = await safe_update_job(session, job_id, {
                             "status": "FAILED",
                             "error": str(e)[:500]  # 
