@@ -1,0 +1,82 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual environments
+venv/
+env/
+ENV/
+.venv
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Environment variables
+.env
+.env.local
+
+# Database
+*.db
+*.sqlite
+
+# Docker
+.dockerignore
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+test_*.py
+*_test.py
+TESTING*.md
+*_logs*.md
+*_logs*.py
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# Data files (large image files)
+data/*.svs
+data/*.tif
+data/*.tiff
+data/*.ndpi
+# Keep data directory structure
+!data/.gitkeep
+
+# Static files (generated results - can be large)
+static/*/
+!static/index.html
+!static/dashboard/
+
+# User files (persistent user data - should not be in git)
+user_files/
+
